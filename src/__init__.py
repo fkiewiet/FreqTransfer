@@ -1,6 +1,9 @@
 """
 Unified import interface for the FreqTransfer project.
 Clean, stable API for notebooks and scripts.
+
+This module lazily exposes ML symbols so that importing `src` never fails even
+when PyTorch isn't installed. Accessing an ML symbol triggers on-demand import.
 """
 
 # --- Core configuration and types ---
@@ -31,15 +34,30 @@ from .utils import (
     sweep_k, sweep_sources,
 )
 
-# --- Optional ML tools (import lazily if torch is installed) ---
-try:
-    from .ml import (
-        build_direct_map, build_freq_transfer,
-        SimpleFNO, LocalCNN, train_model, eval_relative_metrics,
-    )
-    _HAS_ML = True
-except Exception:
-    _HAS_ML = False
+# --- ML symbols (lazy import) ---
+_ML_EXPORTS = {
+    "build_direct_map",
+    "build_freq_transfer",
+    "SimpleFNO",
+    "LocalCNN",
+    "train_model",
+    "eval_relative_metrics",
+}
+
+def __getattr__(name: str):
+    """Lazy-load ML submodule on first access to any ML symbol."""
+    if name in _ML_EXPORTS:
+        from . import ml as _ml
+        try:
+            return getattr(_ml, name)
+        except AttributeError as e:
+            # Re-raise with a clearer message if symbol is missing in ml.py
+            raise AttributeError(f"'src.ml' has no attribute '{name}'") from e
+    raise AttributeError(f"module 'src' has no attribute '{name}'")
+
+def __dir__():
+    # Make ML symbols visible to dir() and auto-complete
+    return sorted(set(globals().keys()) | _ML_EXPORTS)
 
 __all__ = [
     # Config
@@ -54,11 +72,6 @@ __all__ = [
     "plot_field", "plot_residuals",
     "save_field", "load_field", "save_config", "load_config",
     "sweep_k", "sweep_sources",
+    # ML (listed for discoverability; resolved lazily via __getattr__)
+    *sorted(_ML_EXPORTS),
 ]
-
-if _HAS_ML:
-    __all__.extend([
-        "build_direct_map", "build_freq_transfer",
-        "SimpleFNO", "LocalCNN",
-        "train_model", "eval_relative_metrics",
-    ])
