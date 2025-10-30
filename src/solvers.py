@@ -61,23 +61,7 @@ def gmres_solve(
 ) -> SolverResult:
     """
     Solve Ax = b using GMRES and record **relative** residuals.
-
-    Parameters
-    ----------
-    A : sparse matrix or LinearOperator
-        System matrix.
-    b : np.ndarray
-        Right-hand side (flattened).
-    options : SolverOptions | None
-        Solver tolerances; defaults to tol=1e-6, restart=200, maxiter=None.
-    x0 : np.ndarray | None
-        Initial guess.
-    M : LinearOperator | None
-        (Optional) Preconditioner.
-
-    Returns
-    -------
-    SolverResult
+    Compatible with both legacy (tol=) and new (rtol=/atol=) SciPy APIs.
     """
     if options is None:
         options = SolverOptions()
@@ -88,26 +72,38 @@ def gmres_solve(
     rel_hist: list[float] = []
 
     def _callback(rk):
-        # SciPy may pass a residual vector or a scalar norm depending on version
+        # SciPy may pass a vector or a scalar norm
         try:
             rk_norm = float(np.linalg.norm(rk))
         except Exception:
             rk_norm = float(rk)
         rel_hist.append(rk_norm / b_norm)
 
-    # Use legacy 'tol' for widest SciPy compatibility
-    x, info = _gmres(
-        A,
-        b,
-        x0=x0,
-        M=M,
-        tol=options.tol,
-        restart=options.restart,
-        maxiter=options.maxiter,
-        callback=_callback,
-    )
+    # Try legacy API first (tol=); fallback to new API (rtol=/atol=, callback_type)
+    try:
+        x, info = _gmres(
+            A, b,
+            x0=x0, M=M,
+            tol=options.tol,                      # legacy
+            restart=options.restart,
+            maxiter=options.maxiter,
+            callback=_callback,
+        )
+    except TypeError:
+        # New SciPy API
+        kw = dict(
+            x0=x0, M=M,
+            rtol=options.tol, atol=0.0,          # new API
+            restart=options.restart,
+            maxiter=options.maxiter,
+            callback=_callback,
+        )
+        try:
+            # Prefer explicit callback_type if supported
+            x, info = _gmres(A, b, callback_type="pr_norm", **kw)
+        except TypeError:
+            x, info = _gmres(A, b, **kw)
 
-    # Ensure we have at least the final residual if callback didn't fire
     if not rel_hist:
         rel = np.linalg.norm(A @ x - b) / b_norm
         rel_hist.append(float(rel))
@@ -118,6 +114,7 @@ def gmres_solve(
         converged=(info == 0),
         info=info,
     )
+
 
 
 # ----------------------------------------------------------------------
