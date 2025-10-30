@@ -1,0 +1,30 @@
+# ---- Python & Jupyter ----
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+*.log
+
+# ---- Virtual environment ----
+.venv/
+env/
+venv/
+
+# ---- Data & Results ----
+data/processed/
+data/results/
+*.npy
+*.npz
+*.h5
+*.csv
+
+# ---- IDE & System ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---- Environment files ----
+.env
+*.bak
