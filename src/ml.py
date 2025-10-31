@@ -187,72 +187,78 @@ def build_freq_transfer(
 
 
 # =============================================================================
-# Models
+# Models (guarded so import works even if torch is missing)
 # =============================================================================
 
-class SpectralConv2d(nn.Module):
-    """
-    Minimal spectral convolution (FNO-style):
-    - rFFT2 -> keep low-frequency modes -> learn weights -> irFFT2
-    """
-    def __init__(self, in_ch: int, out_ch: int, modes1: int, modes2: int):
-        super().__init__()
-        _require_torch()
-        self.in_ch, self.out_ch = in_ch, out_ch
-        self.modes1, self.modes2 = modes1, modes2
-        scale = 1.0 / max(1, in_ch * out_ch)
-        self.wr = nn.Parameter(torch.randn(in_ch, out_ch, modes1, modes2) * scale)
-        self.wi = nn.Parameter(torch.randn(in_ch, out_ch, modes1, modes2) * scale)
+if torch is None:
+    # Placeholders that error on use but allow importing src.ml safely
+    class _TorchMissing:
+        def __init__(self, *args, **kwargs):
+            _require_torch()
+        def __call__(self, *args, **kwargs):
+            _require_torch()
 
-    def _mul(self, a, wr, wi):
-        # a: (B, C_in, Hm, Wm) complex
-        a_r, a_i = a.real, a.imag
-        out_r = torch.einsum("bcxy, ckom -> bkom", a_r, wr) - torch.einsum("bcxy, ckom -> bkom", a_i, wi)
-        out_i = torch.einsum("bcxy, ckom -> bkom", a_r, wi) + torch.einsum("bcxy, ckom -> bkom", a_i, wr)
-        return torch.complex(out_r, out_i)
+    SimpleFNO = _TorchMissing
+    LocalCNN  = _TorchMissing
 
-    def forward(self, x):
-        B, C, H, W = x.shape
-        x_ft = torch.fft.rfft2(x, norm="ortho")
-        m1 = min(self.modes1, x_ft.shape[-2])
-        m2 = min(self.modes2, x_ft.shape[-1])
-        out_ft = torch.zeros(B, self.out_ch, H, W // 2 + 1, dtype=torch.cfloat, device=x.device)
-        out_ft[:, :, :m1, :m2] = self._mul(x_ft[:, :, :m1, :m2], self.wr, self.wi)
-        return torch.fft.irfft2(out_ft, s=(H, W), norm="ortho").real
+else:
+    class SpectralConv2d(nn.Module):
+        """
+        Minimal spectral convolution (FNO-style):
+        - rFFT2 -> keep low-frequency modes -> learn weights -> irFFT2
+        """
+        def __init__(self, in_ch: int, out_ch: int, modes1: int, modes2: int):
+            super().__init__()
+            self.in_ch, self.out_ch = in_ch, out_ch
+            self.modes1, self.modes2 = modes1, modes2
+            scale = 1.0 / max(1, in_ch * out_ch)
+            self.wr = nn.Parameter(torch.randn(in_ch, out_ch, modes1, modes2) * scale)
+            self.wi = nn.Parameter(torch.randn(in_ch, out_ch, modes1, modes2) * scale)
 
+        def _mul(self, a, wr, wi):
+            a_r, a_i = a.real, a.imag
+            out_r = torch.einsum("bcxy, ckom -> bkom", a_r, wr) - torch.einsum("bcxy, ckom -> bkom", a_i, wi)
+            out_i = torch.einsum("bcxy, ckom -> bkom", a_r, wi) + torch.einsum("bcxy, ckom -> bkom", a_i, wr)
+            return torch.complex(out_r, out_i)
 
-class SimpleFNO(nn.Module):
-    """Tiny FNO-like model: (B, C_in, H, W) -> (B, 2, H, W)."""
-    def __init__(self, in_ch: int = 3, width: int = 48, modes: Tuple[int, int] = (12, 12), layers: int = 4):
-        super().__init__()
-        _require_torch()
-        self.proj_in = nn.Conv2d(in_ch, width, 1)
-        self.spectral = nn.ModuleList([SpectralConv2d(width, width, *modes) for _ in range(layers)])
-        self.w = nn.ModuleList([nn.Conv2d(width, width, 1) for _ in range(layers)])
-        self.act = nn.GELU()
-        self.proj_out = nn.Conv2d(width, 2, 1)
+        def forward(self, x):
+            B, C, H, W = x.shape
+            x_ft = torch.fft.rfft2(x, norm="ortho")
+            m1 = min(self.modes1, x_ft.shape[-2])
+            m2 = min(self.modes2, x_ft.shape[-1])
+            out_ft = torch.zeros(B, self.out_ch, H, W // 2 + 1, dtype=torch.cfloat, device=x.device)
+            out_ft[:, :, :m1, :m2] = self._mul(x_ft[:, :, :m1, :m2], self.wr, self.wi)
+            return torch.fft.irfft2(out_ft, s=(H, W), norm="ortho").real
 
-    def forward(self, x):
-        x = self.proj_in(x)
-        for sc, wc in zip(self.spectral, self.w):
-            x = self.act(sc(x) + wc(x))
-        return self.proj_out(x)
+    class SimpleFNO(nn.Module):
+        """Tiny FNO-like model: (B, C_in, H, W) -> (B, 2, H, W)."""
+        def __init__(self, in_ch: int = 3, width: int = 48, modes: Tuple[int, int] = (12, 12), layers: int = 4):
+            super().__init__()
+            self.proj_in = nn.Conv2d(in_ch, width, 1)
+            self.spectral = nn.ModuleList([SpectralConv2d(width, width, *modes) for _ in range(layers)])
+            self.w = nn.ModuleList([nn.Conv2d(width, width, 1) for _ in range(layers)])
+            self.act = nn.GELU()
+            self.proj_out = nn.Conv2d(width, 2, 1)
 
+        def forward(self, x):
+            x = self.proj_in(x)
+            for sc, wc in zip(self.spectral, self.w):
+                x = self.act(sc(x) + wc(x))
+            return self.proj_out(x)
 
-class LocalCNN(nn.Module):
-    """Lightweight local CNN baseline."""
-    def __init__(self, in_ch: int = 3, width: int = 48):
-        super().__init__()
-        _require_torch()
-        C = width
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, C, 3, padding=1), nn.GELU(),
-            nn.Conv2d(C, C, 3, padding=1),     nn.GELU(),
-            nn.Conv2d(C, C, 3, padding=1),     nn.GELU(),
-            nn.Conv2d(C, 2, 1),
-        )
+    class LocalCNN(nn.Module):
+        """Lightweight local CNN baseline."""
+        def __init__(self, in_ch: int = 3, width: int = 48):
+            super().__init__()
+            C = width
+            self.net = nn.Sequential(
+                nn.Conv2d(in_ch, C, 3, padding=1), nn.GELU(),
+                nn.Conv2d(C, C, 3, padding=1),     nn.GELU(),
+                nn.Conv2d(C, C, 3, padding=1),     nn.GELU(),
+                nn.Conv2d(C, 2, 1),
+            )
+        def forward(self, x): return self.net(x)
 
-    def forward(self, x): return self.net(x)
 
 
 # =============================================================================
