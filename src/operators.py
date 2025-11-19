@@ -72,13 +72,19 @@ def laplacian_operator(grid: GridSpec, fd: FDConfig) -> csc_matrix:
 def _pml_profile(n: int, h: float, thickness: int, m: int, sigma_max: float) -> np.ndarray:
     """
     Generate 1D polynomial PML profile σ(x) increasing toward boundaries.
+    'h' is currently unused (profile is in index space), kept for future
+    physical-coordinate variants.
     """
     sigma = np.zeros(n)
+    if thickness <= 0:
+        return sigma
+    thickness = min(thickness, n // 2)  # safety: don't overlap the whole domain
     for i in range(thickness):
         s = (1 - (i + 0.5) / thickness) ** m
         sigma[i] = sigma_max * s
         sigma[-i - 1] = sigma_max * s
     return sigma
+
 
 
 def _pml_stretching(grid: GridSpec, pml: PMLConfig) -> tuple[np.ndarray, ...]:
@@ -104,32 +110,41 @@ def helmholtz_operator(
 ) -> csc_matrix:
     """
     Assemble the Helmholtz operator:
-        L_ω u = -Δu - k² m(x) u
-    Optionally applies PML damping by modifying the Laplacian coefficients.
+        L_k u = -Δu - k² m(x) u
+
+    Optionally applies PML damping by modifying the Laplacian coefficients
+    via a diagonal complex scaling (approximate coordinate stretching).
     """
     if fd is None:
         fd = FDConfig()
     if m is None:
         m = np.ones(grid.shape, dtype=float)
+    else:
+        m = np.asarray(m, dtype=float).reshape(grid.shape)
 
+    # Base Laplacian
     L = laplacian_operator(grid, fd)
 
-    # --- PML modification ---
-    if pml is not None:
-        sigmas = _pml_stretching(grid, pml)
-        # For each axis, rescale derivatives by (1 + iσ/k)^-1
-        # Approximate multiplicative damping for simplicity
-        damp = np.ones(grid.N, dtype=fd.dtype)
-        for sigma in sigmas:
-            factor = 1.0 / (1.0 + 1j * sigma / k)
-            # broadcast across that axis
-            shape_full = [1] * grid.dims
-            axis = len(sigmas) - len(shape_full)
-            shape_full[axis] = len(sigma)
-            damp_axis = factor.reshape(shape_full)
-            damp *= np.broadcast_to(damp_axis, grid.shape).ravel()
-        # Scale Laplacian entries (diagonal scaling)
-        D = diags(damp, 0, format="csc", dtype=fd.dtype)
+    # --- PML modification (approximate) ---
+    if pml is not None and pml.thickness > 0 and pml.sigma_max > 0.0:
+        sigmas = _pml_stretching(grid, pml)  # tuple of 1D arrays, one per axis
+
+        # Build index grid once: coords[axis] has shape grid.shape and holds indices along that axis
+        coords = np.meshgrid(
+            *[np.arange(n) for n in grid.shape],
+            indexing="ij",
+        )
+
+        # Start with unit damping everywhere
+        damp = np.ones(grid.shape, dtype=fd.dtype)
+
+        # For each axis, compute (1 + i σ/k)^-1 and multiply into the full-grid factor
+        for axis, sigma_1d in enumerate(sigmas):
+            factor_1d = 1.0 / (1.0 + 1j * sigma_1d / k)
+            damp *= factor_1d[coords[axis]]
+
+        # Diagonal scaling of the Laplacian
+        D = diags(damp.ravel(), 0, format="csc", dtype=fd.dtype)
         L = D @ L @ D
 
     # --- Add -k² m(x) term ---
@@ -137,6 +152,7 @@ def helmholtz_operator(
     A = (-L - M).astype(fd.dtype)
 
     return A
+
 
 
 # ----------------------------------------------------------------------
@@ -162,6 +178,37 @@ def assemble_operator(
     raise ValueError(f"Unsupported operator kind: {kind!r}")
 
 
+def make_extended_grid(grid_phys: GridSpec, pml: PMLConfig) -> GridSpec:
+    """
+    Create a grid that adds a PML 'shell' of thickness pml.thickness
+    *around* the physical grid.
+
+    - The physical domain spacing is preserved.
+    - The interior block of the extended grid corresponds to the original
+      physical domain [0, Lx] x [0, Ly].
+    """
+    T = pml.thickness
+    ny, nx = grid_phys.shape
+    Ly, Lx = grid_phys.lengths
+    hy, hx = grid_phys.spacing  # assuming GridSpec exposes this
+
+    # New shape: interior + PML shell on both sides
+    ny_ext = ny + 2 * T
+    nx_ext = nx + 2 * T
+
+    # Extend physical lengths so that spacing stays the same:
+    # Lx_ext = Lx + 2*T*hx  ⇒ hx_ext = hx
+    Ly_ext = Ly + 2 * T * hy
+    Lx_ext = Lx + 2 * T * hx
+
+    grid_ext = GridSpec(
+        dims=grid_phys.dims,
+        shape=(ny_ext, nx_ext),
+        lengths=(Ly_ext, Lx_ext),
+    )
+    return grid_ext
+
+
 # ----------------------------------------------------------------------
 # === Public symbols ===
 # ----------------------------------------------------------------------
@@ -170,4 +217,6 @@ __all__ = [
     "laplacian_operator",
     "helmholtz_operator",
     "assemble_operator",
+    "make_extended_grid",
+    
 ]

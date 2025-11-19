@@ -197,3 +197,48 @@ def direct_solve_auto(
 
     A = assemble_operator(grid=grid, k=k, kind="helmholtz", fd=fd, pml=pml, m=m)
     return direct_solve(A, rhs)
+
+
+
+def solve_with_pml_shell(
+    grid_phys: GridSpec,
+    k: float,
+    b_phys: np.ndarray,
+    pml: PMLConfig,
+    kind: str = "helmholtz",
+):
+    """
+    Solve Helmholtz on an *extended* grid where the PML shell lives
+    outside the physical domain.
+
+    - grid_phys: original physical grid (e.g. 48x48)
+    - b_phys: RHS on the physical grid, flattened with shape (grid_phys.N,)
+
+    Returns:
+        u_phys_flat: solution on the interior (physical) grid, flattened
+        u_ext_flat: full extended solution (optional to use / visualize)
+    """
+    T = pml.thickness
+    ny, nx = grid_phys.shape
+
+    # 1. Build extended grid
+    grid_ext = make_extended_grid(grid_phys, pml)
+    ny_ext, nx_ext = grid_ext.shape
+
+    # 2. Embed RHS into extended grid (zero outside physical domain)
+    b_ext_2d = np.zeros(grid_ext.shape, dtype=b_phys.dtype)
+    b_ext_2d[T:T+ny, T:T+nx] = b_phys.reshape(grid_phys.shape)
+    b_ext = b_ext_2d.ravel()
+
+    # 3. Assemble operator with PML on the extended grid
+    A_ext = assemble_operator(grid_ext, k=k, kind=kind, pml=pml)
+
+    # 4. Solve
+    res_ext = direct_solve(A_ext, b_ext)
+    u_ext_2d = res_ext.solution.reshape(grid_ext.shape)
+
+    # 5. Crop interior block back to physical domain
+    u_phys_2d = u_ext_2d[T:T+ny, T:T+nx]
+    u_phys = u_phys_2d.ravel()
+
+    return u_phys, u_ext_2d, grid_ext
