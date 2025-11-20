@@ -178,26 +178,25 @@ def assemble_operator(
     raise ValueError(f"Unsupported operator kind: {kind!r}")
 
 
+# ---------------------------------------------------------------------------
+# PML shell helpers: extend grid and crop interior
+# ---------------------------------------------------------------------------
+
 def make_extended_grid(grid_phys: GridSpec, pml: PMLConfig) -> GridSpec:
     """
-    Create a grid that adds a PML 'shell' of thickness pml.thickness
-    *around* the physical grid.
+    Create an extended grid that adds a PML 'shell' of thickness pml.thickness
+    around the physical grid.
 
-    - The physical domain spacing is preserved.
-    - The interior block of the extended grid corresponds to the original
-      physical domain [0, Lx] x [0, Ly].
+    The interior block of the extended grid corresponds to the original
+    physical domain with the same spacing; the PML cells live outside.
     """
     T = pml.thickness
     ny, nx = grid_phys.shape
     Ly, Lx = grid_phys.lengths
-    hy, hx = grid_phys.spacing  # assuming GridSpec exposes this
+    hy, hx = grid_phys.spacing  # assumes GridSpec exposes spacing
 
-    # New shape: interior + PML shell on both sides
     ny_ext = ny + 2 * T
     nx_ext = nx + 2 * T
-
-    # Extend physical lengths so that spacing stays the same:
-    # Lx_ext = Lx + 2*T*hx  ⇒ hx_ext = hx
     Ly_ext = Ly + 2 * T * hy
     Lx_ext = Lx + 2 * T * hx
 
@@ -209,14 +208,60 @@ def make_extended_grid(grid_phys: GridSpec, pml: PMLConfig) -> GridSpec:
     return grid_ext
 
 
-# ----------------------------------------------------------------------
-# === Public symbols ===
-# ----------------------------------------------------------------------
+def solve_with_pml_shell(
+    grid_phys: GridSpec,
+    k: float,
+    b_phys: np.ndarray,
+    pml: PMLConfig,
+    kind: str = "helmholtz",
+):
+    """
+    Solve Helmholtz/Poisson on an extended grid with a PML shell outside
+    the physical domain.
 
-__all__ = [
-    "laplacian_operator",
-    "helmholtz_operator",
-    "assemble_operator",
-    "make_extended_grid",
-    
-]
+    Parameters
+    ----------
+    grid_phys : GridSpec
+        Physical domain grid (e.g. 48x48 or 96x96).
+    k : float
+        Wavenumber.
+    b_phys : np.ndarray
+        Right-hand side on the physical grid (flattened, size = grid_phys.N).
+    pml : PMLConfig
+        PML configuration (thickness, order, sigma_max).
+    kind : {"helmholtz", "laplacian"}
+        Operator kind to assemble.
+
+    Returns
+    -------
+    u_phys_flat : np.ndarray
+        Solution restricted to the physical grid, flattened (size = grid_phys.N).
+    u_ext_2d : np.ndarray
+        Solution on the extended grid, 2D array of shape grid_ext.shape.
+    grid_ext : GridSpec
+        Extended grid specification.
+    """
+    T = pml.thickness
+    ny, nx = grid_phys.shape
+
+    # 1. Build extended grid
+    grid_ext = make_extended_grid(grid_phys, pml)
+    ny_ext, nx_ext = grid_ext.shape
+
+    # 2. Embed RHS into extended grid (zero outside physical domain)
+    b_ext_2d = np.zeros(grid_ext.shape, dtype=b_phys.dtype)
+    b_ext_2d[T:T+ny, T:T+nx] = b_phys.reshape(grid_phys.shape)
+    b_ext = b_ext_2d.ravel()
+
+    # 3. Assemble operator with PML on the extended grid
+    A_ext = assemble_operator(grid_ext, k=k, kind=kind, pml=pml)
+
+    # 4. Direct solve
+    res_ext = direct_solve(A_ext, b_ext)
+    u_ext_2d = res_ext.solution.reshape(grid_ext.shape)
+
+    # 5. Crop interior block back to physical grid
+    u_phys_2d = u_ext_2d[T:T+ny, T:T+nx]
+    u_phys = u_phys_2d.ravel()
+
+    return u_phys, u_ext_2d, grid_ext

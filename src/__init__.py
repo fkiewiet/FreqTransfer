@@ -14,9 +14,11 @@ from .loads import PointSource, PlaneWave, RandomPointSource, build_load
 
 # --- Operators (assembly of linear systems) ---
 from .operators import (
-    laplacian_operator,
-    helmholtz_operator,
     assemble_operator,
+    helmholtz_operator,
+    laplacian_operator,
+    make_extended_grid,
+    solve_with_pml_shell,
 )
 
 # --- Solvers (GMRES / direct) ---
@@ -32,6 +34,15 @@ from .utils import (
     plot_field, plot_residuals,
     save_field, load_field, save_config, load_config,
     sweep_k, sweep_sources,
+)
+
+from .ml import (
+    SimpleFNO,
+    LocalCNN,
+    train_model,
+    eval_relative_metrics,
+    HelmholtzFreqTransferDataset,
+    evaluate_transfer_model,
 )
 
 # --- ML symbols (lazy import) ---
