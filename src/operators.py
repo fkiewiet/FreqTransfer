@@ -17,6 +17,7 @@ from scipy.sparse import diags, eye, kron, csc_matrix
 from .config import GridSpec, FDConfig, PMLConfig
 
 
+
 # ----------------------------------------------------------------------
 # === Utility: 1D finite-difference Laplacian ===
 # ----------------------------------------------------------------------
