@@ -15,8 +15,8 @@ Public API:
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
-from torch.utils.data import Dataset
-import numpy as np
+from pathlib import Path
+import json
 
 
 # ----------------------------- Soft dependency guard -------------------------
@@ -33,7 +33,7 @@ except Exception as _e:
 
 import numpy as np
 
-from .config import GridSpec, SolverOptions, PMLConfig
+from .config import GridSpec, SolverOptions, PMLConfig, DATA_DIR
 from .loads import build_load, RandomPointSource
 from .operators import assemble_operator, solve_with_pml_shell
 from .solvers import gmres_solve
@@ -144,6 +144,187 @@ def build_direct_map(
     return HelmholtzDirectDataset(X, Y)
 
 
+# =============================================================================
+# Cached frequency-transfer datasets (disk-backed)
+# =============================================================================
+
+class PrecomputedFreqDataset(Dataset):
+    """
+    Dataset that serves precomputed (u_src, u_tgt) from X.npy/Y.npy on disk.
+
+    Each item:
+      x: (2, H, W) float32  -> source field [Re, Im]
+      y: (2, H, W) float32  -> target field [Re, Im]
+    """
+    def __init__(self, root: Path):
+        _require_torch()
+        self.root = Path(root)
+        self.X = np.load(self.root / "X.npy")  # (N,2,H,W)
+        self.Y = np.load(self.root / "Y.npy")  # (N,2,H,W)
+        with open(self.root / "meta.json", "r") as f:
+            self.meta = json.load(f)
+
+    def __len__(self) -> int:
+        return self.X.shape[0]
+
+    def __getitem__(self, idx: int):
+        x = torch.from_numpy(self.X[idx]).float()
+        y = torch.from_numpy(self.Y[idx]).float()
+        return x, y
+
+
+def _freq_dataset_name(grid: GridSpec,
+                       pml: PMLConfig,
+                       omega_src: float,
+                       omega_tgt: float,
+                       N_samples: int) -> str:
+    """
+    Construct a deterministic cache name from numerical + ML parameters.
+    """
+    H, W = grid.shape
+    name = (
+        f"wsrc{omega_src:.3f}_wtgt{omega_tgt:.3f}"
+        f"_N{N_samples}_"
+        f"grid{H}x{W}_"
+        f"pmlT{pml.thickness}_m{pml.m}_sig{pml.sigma_max:.2f}"
+    )
+    # make it filesystem-friendly
+    return name.replace(".", "p")
+
+
+def get_freq_dataset(
+    grid: GridSpec,
+    pml: PMLConfig,
+    omega_src: float,
+    omega_tgt: float,
+    N_samples: int,
+    omega_to_k=None,
+    cache_root: Path | None = None,
+    overwrite: bool = False,
+) -> Dataset:
+    """
+    Build or load a frequency-transfer dataset, with automatic caching.
+
+    First call with a new (grid, pml, omega_src, omega_tgt, N_samples):
+        - runs HelmholtzFreqTransferDataset once,
+        - stores X,Y and metadata in DATA_DIR/freq_transfer_cached/...,
+        - returns a PrecomputedFreqDataset view.
+
+    Subsequent calls with the same parameters:
+        - load X,Y,meta directly from disk (no solves).
+
+    Parameters
+    ----------
+    grid, pml : GridSpec, PMLConfig
+        Numerical setup (must match your solver experiments).
+    omega_src, omega_tgt : float
+        Source and target frequencies.
+    N_samples : int
+        Number of random RHS realisations.
+    omega_to_k : callable(omega) -> k, optional
+        Mapping from frequency to wavenumber. Default: k = omega (c=1).
+    cache_root : Path, optional
+        Base directory for cached datasets. Default: DATA_DIR / "freq_transfer_cached".
+    overwrite : bool
+        If True, always recompute and overwrite existing cache.
+
+    Returns
+    -------
+    Dataset
+        A torch Dataset returning (u_src, u_tgt) tensors.
+    """
+    _require_torch()
+
+    if omega_to_k is None:
+        def omega_to_k(omega: float) -> float:
+            c = 1.0
+            return float(omega / c)
+
+    if cache_root is None:
+        cache_root = DATA_DIR / "freq_transfer_cached"
+
+    cache_root = Path(cache_root)
+    cache_root.mkdir(parents=True, exist_ok=True)
+
+    name = _freq_dataset_name(grid, pml, omega_src, omega_tgt, N_samples)
+    ds_dir = cache_root / name
+
+    # ---------------------------------------------------------
+    # Case 1: cache exists and we keep it -> just load
+    # ---------------------------------------------------------
+    if ds_dir.exists() and not overwrite:
+        print(f"[get_freq_dataset] Loading cached dataset from: {ds_dir}")
+        ds = PrecomputedFreqDataset(ds_dir)
+        print(
+            f"  Loaded N={len(ds)} samples, "
+            f"ω_src={ds.meta['omega_src']}, ω_tgt={ds.meta['omega_tgt']}"
+        )
+        return ds
+
+    # ---------------------------------------------------------
+    # Case 2: no cache yet OR overwrite requested -> compute
+    # ---------------------------------------------------------
+    print(f"[get_freq_dataset] Generating new dataset: {name}")
+    ds_dir.mkdir(parents=True, exist_ok=True)
+
+    # deterministic seeds for reproducibility
+    rng = np.random.default_rng(12345)
+    seeds = list(rng.integers(0, 1_000_000, size=N_samples))
+
+    # Online (solver-based) dataset
+    online_ds = HelmholtzFreqTransferDataset(
+        grid=grid,
+        pml=pml,
+        omega_src=omega_src,
+        omega_tgt=omega_tgt,
+        seeds=seeds,
+        omega_to_k=omega_to_k,
+    )
+
+    # Peek at shape
+    u_src0, u_tgt0 = online_ds[0]
+    C, H, W = u_src0.shape
+    X = np.zeros((N_samples, C, H, W), dtype=np.float32)
+    Y = np.zeros((N_samples, C, H, W), dtype=np.float32)
+
+    # Solve once per sample and store to disk
+    for i in range(N_samples):
+        if i % max(1, N_samples // 10) == 0:
+            print(f"  solving sample {i}/{N_samples} ...")
+        u_src, u_tgt = online_ds[i]
+        X[i] = u_src.numpy()
+        Y[i] = u_tgt.numpy()
+
+    # Save arrays
+    np.save(ds_dir / "X.npy", X)
+    np.save(ds_dir / "Y.npy", Y)
+
+    # Save metadata
+    meta = {
+        "omega_src": float(omega_src),
+        "omega_tgt": float(omega_tgt),
+        "grid_shape": list(grid.shape),
+        "grid_lengths": list(grid.lengths),
+        "pml": {
+            "thickness": int(pml.thickness),
+            "m": int(pml.m),
+            "sigma_max": float(pml.sigma_max),
+        },
+        "N_samples": int(N_samples),
+        "seeds": seeds,
+    }
+    with open(ds_dir / "meta.json", "w") as f:
+        json.dump(meta, f, indent=2)
+
+    print(f"[get_freq_dataset] Saved dataset to {ds_dir}")
+    print(f"  X.npy shape: {X.shape}")
+    print(f"  Y.npy shape: {Y.shape}")
+
+    # Return disk-backed view
+    return PrecomputedFreqDataset(ds_dir)
+
+
+
 def build_freq_transfer(
     n: int,
     grid: GridSpec,
@@ -191,54 +372,57 @@ def build_freq_transfer(
 
 class HelmholtzFreqTransferDataset(Dataset):
     """
-    Dataset of frequency-transfer pairs (u_src, u_tgt) generated by
-    direct solves with a PML shell, for the same random RHS.
+    Dataset returning (u_src, u_tgt) as 2-channel real tensors
+    computed via solve_with_pml_shell at two frequencies.
 
-    Each sample:
-        u_src: solution at omega_src (2, Ny, Nx) [real, imag]
-        u_tgt: solution at omega_tgt (2, Ny, Nx) [real, imag]
+    NOTE:
+    - Normalisation (mean/std, amplitude) should be applied OUTSIDE this class,
+      not inside it, to avoid breaking file structure.
     """
-    def __init__(
-        self,
-        grid: GridSpec,
-        pml: PMLConfig,
-        omega_src: float,
-        omega_tgt: float,
-        seeds: list[int],
-        omega_to_k: callable,
-    ):
+
+    def __init__(self, grid, pml, omega_src, omega_tgt, seeds, omega_to_k):
         self.grid = grid
         self.pml = pml
-        self.omega_src = float(omega_src)
-        self.omega_tgt = float(omega_tgt)
-        self.seeds = list(seeds)
-        self.ny, self.nx = grid.shape
+        self.omega_src = omega_src
+        self.omega_tgt = omega_tgt
+        self.seeds = seeds
         self.omega_to_k = omega_to_k
 
-    def __len__(self) -> int:
-        return len(self.seeds)
-
+    # ---------------------------------------------------------------
+    # Correct helper: SOLVE AT A SINGLE FREQUENCY
+    # ---------------------------------------------------------------
     def _solve_at_omega(self, omega: float, seed: int) -> np.ndarray:
         k = float(self.omega_to_k(omega))
+
         rhs_spec = RandomPointSource(seed=seed)
-        b = build_load(rhs_spec, self.grid)  # flattened on physical grid
+        b = build_load(rhs_spec, self.grid)              # (N_phys,)
         u_phys, _, _ = solve_with_pml_shell(self.grid, k, b, self.pml)
-        return u_phys.reshape(self.grid.shape)
 
-    def __getitem__(self, idx: int):
+        return u_phys.reshape(self.grid.shape)           # (H,W) complex
+
+    # ---------------------------------------------------------------
+    # Solve for BOTH frequencies
+    # ---------------------------------------------------------------
+    def _solve_pair(self, idx: int):
         seed = self.seeds[idx]
-
         u_src = self._solve_at_omega(self.omega_src, seed)
         u_tgt = self._solve_at_omega(self.omega_tgt, seed)
 
-        # Stack real/imag as channels
-        u_src_ch = np.stack([u_src.real, u_src.imag], axis=0)
-        u_tgt_ch = np.stack([u_tgt.real, u_tgt.imag], axis=0)
+        # Convert complex -> 2-channel real
+        u_src_2ch = np_complex_to_2ch(u_src)[0]          # (2,H,W)
+        u_tgt_2ch = np_complex_to_2ch(u_tgt)[0]          # (2,H,W)
 
-        u_src_tensor = torch.from_numpy(u_src_ch.astype(np.float32))
-        u_tgt_tensor = torch.from_numpy(u_tgt_ch.astype(np.float32))
+        return (
+            torch.from_numpy(u_src_2ch).float(),
+            torch.from_numpy(u_tgt_2ch).float()
+        )
 
-        return u_src_tensor, u_tgt_tensor
+    # ---------------------------------------------------------------
+    def __getitem__(self, idx):
+        return self._solve_pair(idx)
+
+    def __len__(self):
+        return len(self.seeds)
 
 
 # =============================================================================
@@ -502,14 +686,19 @@ def evaluate_transfer_model(model: torch.nn.Module,
 __all__ = [
     # datasets
     "HelmholtzDirectDataset",
+    "HelmholtzFreqTransferDataset",
+    "PrecomputedFreqDataset",
     "build_direct_map",
     "build_freq_transfer",
+    "get_freq_dataset",
     # models
     "SimpleFNO",
     "LocalCNN",
     # training / metrics
     "train_model",
     "eval_relative_metrics",
+    "evaluate_transfer_model",
     # utilities
     "np_complex_to_2ch",
 ]
+
