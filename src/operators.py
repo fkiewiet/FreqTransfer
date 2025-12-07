@@ -242,6 +242,9 @@ def solve_with_pml_shell(
     grid_ext : GridSpec
         Extended grid specification.
     """
+    # 🔹 IMPORTANT: local import to avoid circular import problems
+    from .solvers import direct_solve
+
     T = pml.thickness
     ny, nx = grid_phys.shape
 
@@ -257,7 +260,7 @@ def solve_with_pml_shell(
     # 3. Assemble operator with PML on the extended grid
     A_ext = assemble_operator(grid_ext, k=k, kind=kind, pml=pml)
 
-    # 4. Direct solve
+    # 4. Direct solve on the extended grid
     res_ext = direct_solve(A_ext, b_ext)
     u_ext_2d = res_ext.solution.reshape(grid_ext.shape)
 
