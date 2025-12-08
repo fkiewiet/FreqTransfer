@@ -11,6 +11,10 @@ from typing import Literal, Optional
 import numpy as np
 from pathlib import Path
 
+def omega_to_k(omega: float) -> float:
+    c = 1.0
+    return omega / c
+
 # ----------------------------------------------------------------------
 # === Numerical configuration dataclasses ===
 # ----------------------------------------------------------------------
@@ -74,6 +78,9 @@ class SolverOptions:
     tol: float = 1e-6
     restart: int = 200
     maxiter: Optional[int] = None
+
+
+
 
 
 # ----------------------------------------------------------------------
