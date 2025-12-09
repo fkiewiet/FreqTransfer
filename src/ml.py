@@ -310,20 +310,21 @@ class SimpleFNO(nn.Module):
         return x
 
 
-    class LocalCNN(nn.Module):
-        """Lightweight local CNN baseline."""
-        def __init__(self, in_ch: int = 3, width: int = 48):
-            super().__init__()
-            C = width
-            self.net = nn.Sequential(
-                nn.Conv2d(in_ch, C, 3, padding=1), nn.GELU(),
-                nn.Conv2d(C, C, 3, padding=1),     nn.GELU(),
-                nn.Conv2d(C, C, 3, padding=1),     nn.GELU(),
-                nn.Conv2d(C, 2, 1),
-            )
+class LocalCNN(nn.Module):
+    def __init__(self, in_ch: int = 3, width: int = 64):
+        super().__init__()
+        C = width
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, C, 3, padding=1), nn.GELU(),
+            nn.Conv2d(C, C, 3, padding=1),     nn.GELU(),
+            nn.Conv2d(C, C, 3, padding=1),     nn.GELU(),
+            nn.Conv2d(C, C, 3, padding=1),     nn.GELU(),
+            nn.Conv2d(C, 2, 1),
+        )
 
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            return self.net(x)
+    def forward(self, x):
+        return self.net(x)
+
 
 # =============================================================================
 # Training & metrics
